@@ -1,11 +1,10 @@
 import fs from 'node:fs/promises';
+import http from 'node:http';
+import https from 'node:https';
 import path from 'node:path';
 import nodemailer from 'nodemailer';
 
 const requiredEnv = [
-  'APIFY_TOKEN',
-  'APIFY_ACTOR_ID',
-  'GEMINI_API_KEY',
   'GEMINI_MODEL',
   'SMTP_HOST',
   'SMTP_PORT',
@@ -26,15 +25,20 @@ function optionalEnv(name) {
   return value && value.trim() ? value.trim() : undefined;
 }
 
+function describeError(err) {
+  const parts = [err?.message, err?.code, err?.cause?.message, err?.cause?.code].filter(Boolean);
+  return [...new Set(parts)].join(' | ') || String(err);
+}
+
 async function withRetry(fn, { retries = 3, baseDelayMs = 2000, label = 'operation' } = {}) {
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
       return await fn();
     } catch (err) {
-      const isRetryable = /ECONNRESET|ETIMEDOUT|ENOTFOUND|UND_ERR|fetch failed|AbortError|50[0-3]|429/i.test(err?.message || '');
+      const isRetryable = /ECONNRESET|ETIMEDOUT|ENOTFOUND|UND_ERR|fetch failed|AbortError|LLM_SOCKET_TIMEOUT|50[0-3]|429/i.test(describeError(err));
       if (attempt >= retries || !isRetryable) throw err;
       const delay = baseDelayMs * (2 ** attempt);
-      console.warn(`${label} attempt ${attempt + 1} failed: ${err.message}. Retrying in ${delay}ms...`);
+      console.warn(`${label} attempt ${attempt + 1} failed: ${describeError(err)}. Retrying in ${delay}ms...`);
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
@@ -57,6 +61,76 @@ function normalizeApifyToken(raw) {
   }
 }
 
+function stripWrappingQuotes(value) {
+  const trimmed = value.trim();
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function normalizeGeminiApiKey(raw) {
+  let value = stripWrappingQuotes(raw);
+
+  const assignmentMatch = value.match(/^(?:GEMINI_API_KEY|GOOGLE_API_KEY|GOOGLE_GEMINI_API_KEY|LLM_API_KEY|OPENAI_API_KEY)\s*=\s*(.+)$/i);
+  if (assignmentMatch?.[1]) value = stripWrappingQuotes(assignmentMatch[1]);
+
+  if (/^Bearer\s+/i.test(value)) value = value.replace(/^Bearer\s+/i, '').trim();
+
+  if (value.includes('key=')) {
+    try {
+      const parsedUrl = new URL(value);
+      value = parsedUrl.searchParams.get('key') || value;
+    } catch {
+      const match = value.match(/[?&]key=([^&\s]+)/);
+      if (match?.[1]) value = decodeURIComponent(match[1]);
+    }
+  }
+
+  return stripWrappingQuotes(value);
+}
+
+function isPlaceholderSecret(value) {
+  return /^(\*+|x+|<.+>|\{\{.+\}\}|your[_ -]?api[_ -]?key|replace[_ -]?me)$/i.test(value.trim());
+}
+
+function isValidGeminiApiKey(value) {
+  return Boolean(value) && !isPlaceholderSecret(value) && !/\s/.test(value);
+}
+
+let cachedGeminiApiKey;
+
+function requireGeminiApiKey() {
+  if (cachedGeminiApiKey) return cachedGeminiApiKey;
+
+  const candidates = ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'GOOGLE_GEMINI_API_KEY', 'LLM_API_KEY', 'OPENAI_API_KEY'];
+  const configured = candidates
+    .map((name) => ({ name, raw: process.env[name] }))
+    .filter(({ raw }) => raw && raw.trim())
+    .map(({ name, raw }) => ({ name, apiKey: normalizeGeminiApiKey(raw) }));
+
+  if (configured.length === 0) {
+    throw new Error(`Missing required environment variable: GEMINI_API_KEY (or fallback ${candidates.slice(1).join('/')})`);
+  }
+
+  const valid = configured.find(({ apiKey }) => isValidGeminiApiKey(apiKey));
+  if (!valid) {
+    const names = configured.map(({ name }) => name).join(', ');
+    throw new Error(
+      `Invalid LLM API key configured in ${names}. Store only the raw API key value in GitHub Secrets, without quotes, labels, JSON, or a full request URL.`,
+    );
+  }
+
+  const skipped = configured.filter(({ name, apiKey }) => name !== valid.name && !isValidGeminiApiKey(apiKey));
+  if (skipped.length > 0) {
+    console.warn(`Ignoring invalid LLM API key secret(s): ${skipped.map(({ name }) => name).join(', ')}`);
+  }
+
+  console.log(`Using LLM API key from ${valid.name} (${maskSecret(valid.apiKey)})`);
+  cachedGeminiApiKey = valid.apiKey;
+  return cachedGeminiApiKey;
+}
+
 function parseBooleanEnv(value, fallback = false) {
   if (typeof value !== 'string') return fallback;
   const v = value.trim().toLowerCase();
@@ -69,6 +143,63 @@ function maskSecret(value) {
   if (!value) return '(empty)';
   if (value.length <= 4) return '*'.repeat(value.length);
   return `${value.slice(0, 2)}***${value.slice(-2)}`;
+}
+
+function getTweetDataSource() {
+  const configured = optionalEnv('TWEET_DATA_SOURCE') || optionalEnv('TWITTER_DATA_SOURCE') || optionalEnv('DATA_SOURCE');
+  if (configured) {
+    const value = configured.toLowerCase();
+    if (['apify', 'twitterapi'].includes(value)) return value;
+    throw new Error(`Unsupported TWEET_DATA_SOURCE/TWITTER_DATA_SOURCE: ${configured}. Use "apify" or "twitterapi".`);
+  }
+  return optionalEnv('TWITTER_API_KEY') ? 'twitterapi' : 'apify';
+}
+
+function requireDataSourceEnv(dataSource) {
+  if (dataSource === 'twitterapi') {
+    requireEnv('TWITTER_API_KEY');
+    return;
+  }
+  requireEnv('APIFY_TOKEN');
+  requireEnv('APIFY_ACTOR_ID');
+}
+
+function getTwitterApiEndpoint() {
+  return optionalEnv('TWITTER_API_ENDPOINT') || 'https://api.twitterapi.io/twitter/user/last_tweets';
+}
+
+function getTwitterApiKeyHeaderName() {
+  return optionalEnv('TWITTER_API_KEY_HEADER') || 'X-API-Key';
+}
+
+function getTwitterApiRequestTimeoutMs() {
+  return parsePositiveIntegerEnv(['TWITTER_API_REQUEST_TIMEOUT_MS'], 60_000);
+}
+
+function getTwitterApiMaxPagesPerUser() {
+  return parsePositiveIntegerEnv(['TWITTER_API_MAX_PAGES_PER_USER'], 10);
+}
+
+function getTwitterApiConcurrency() {
+  return parsePositiveIntegerEnv(['TWITTER_API_CONCURRENCY'], 5);
+}
+
+function getTwitterApiPageDelayMs() {
+  const value = Number(optionalEnv('TWITTER_API_PAGE_DELAY_MS') || 0);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function getTwitterApiFetchOverlapHours() {
+  const value = Number(optionalEnv('TWITTER_FETCH_OVERLAP_HOURS') || 6);
+  return Number.isFinite(value) && value >= 0 ? value : 6;
+}
+
+function getTweetStorePath() {
+  return optionalEnv('TWEET_STORE_PATH') || 'artifacts/twitter-tweet-store.json';
+}
+
+function getTweetStoreRetentionDays() {
+  return parsePositiveIntegerEnv(['TWEET_STORE_RETENTION_DAYS'], 14);
 }
 
 function formatBjtDateDaysAgo(daysAgo) {
@@ -128,7 +259,7 @@ function parsePeopleRoster(raw) {
 }
 
 function getRosterFromEnvOrTemplate(templateInput) {
-  const envRoster = parsePeopleRoster(optionalEnv('APIFY_PEOPLE_JSON'));
+  const envRoster = parsePeopleRoster(optionalEnv('TWITTER_PEOPLE_JSON') || optionalEnv('TWEET_PEOPLE_JSON') || optionalEnv('APIFY_PEOPLE_JSON'));
   if (envRoster.length > 0) return envRoster;
 
   const searchTerms = Array.isArray(templateInput?.searchTerms) ? templateInput.searchTerms : [];
@@ -632,12 +763,11 @@ function analyzeInteractions(items, handleSet) {
 
     // Reply: author replied to target's tweet
     const replyTo = String(item?.inReplyToStatusId || item?.inReplyToStatusIdStr || '').trim();
-    if (replyTo && tweetAuthor.has(replyTo)) {
-      const target = tweetAuthor.get(replyTo);
-      if (target !== author && handleSet.has(target)) {
-        ensureEntry(author).repliedTo.add(target);
-        ensureEntry(target).mentionedBy.add(author);
-      }
+    const replyToUsername = normalizeHandle(item?.inReplyToUsername || item?.in_reply_to_username);
+    const replyTarget = replyTo && tweetAuthor.has(replyTo) ? tweetAuthor.get(replyTo) : replyToUsername;
+    if (replyTarget && replyTarget !== author && handleSet.has(replyTarget)) {
+      ensureEntry(author).repliedTo.add(replyTarget);
+      ensureEntry(replyTarget).mentionedBy.add(author);
     }
 
     // Quote: author quoted target's tweet (distinct from reply)
@@ -652,7 +782,11 @@ function analyzeInteractions(items, handleSet) {
 
     // @mention: author mentioned target in text
     const text = extractTextFromItem(item);
-    const mentions = text.match(/@(\w+)/g) || [];
+    const textMentions = text.match(/@(\w+)/g) || [];
+    const entityMentions = Array.isArray(item?.entities?.user_mentions)
+      ? item.entities.user_mentions.map((mention) => mention?.screen_name).filter(Boolean)
+      : [];
+    const mentions = [...textMentions, ...entityMentions];
     for (const m of mentions) {
       const mentionedHandle = normalizeHandle(m);
       if (mentionedHandle !== author && handleSet.has(mentionedHandle)) {
@@ -1453,10 +1587,196 @@ function getPromptTemplate() {
 `;
 }
 
-async function requestGeminiReportOnce({ apiKey, model, prompt }) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5 * 60 * 1000); // 5 minutes (Gemini 3 thinking + large output needs more time)
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+function parsePositiveIntegerEnv(names, fallback) {
+  for (const name of names) {
+    const value = optionalEnv(name);
+    if (!value) continue;
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    console.warn(`Ignoring invalid positive integer env ${name}=${value}; using fallback ${fallback}.`);
+  }
+  return fallback;
+}
+
+function getLlmSocketTimeoutMs() {
+  return parsePositiveIntegerEnv(['LLM_SOCKET_TIMEOUT_MS', 'GEMINI_SOCKET_TIMEOUT_MS', 'LLM_CONNECT_TIMEOUT_MS', 'GEMINI_CONNECT_TIMEOUT_MS'], 60_000);
+}
+
+function getLlmRequestTimeoutMs() {
+  return parsePositiveIntegerEnv(['LLM_REQUEST_TIMEOUT_MS', 'GEMINI_REQUEST_TIMEOUT_MS'], 5 * 60 * 1000);
+}
+
+function createTextResponse({ statusCode, headers, bodyText }) {
+  return {
+    ok: statusCode >= 200 && statusCode < 300,
+    status: statusCode,
+    headers,
+    text: async () => bodyText,
+    json: async () => JSON.parse(bodyText),
+  };
+}
+
+function requestJson(url, { headers, body, signal, timeoutMs = 60_000 }) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const transport = parsedUrl.protocol === 'http:' ? http : https;
+    const requestBody = JSON.stringify(body);
+
+    const req = transport.request(
+      parsedUrl,
+      {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'Content-Length': Buffer.byteLength(requestBody),
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          cleanup();
+          resolve(createTextResponse({
+            statusCode: res.statusCode || 0,
+            headers: res.headers,
+            bodyText: Buffer.concat(chunks).toString('utf8'),
+          }));
+        });
+      },
+    );
+
+    const cleanup = () => {
+      signal?.removeEventListener('abort', onAbort);
+    };
+
+    const onAbort = () => {
+      const abortError = new Error(`LLM request aborted after ${getLlmRequestTimeoutMs()}ms overall timeout: ${parsedUrl.origin}`);
+      abortError.code = 'LLM_REQUEST_ABORTED';
+      req.destroy(abortError);
+    };
+
+    req.setTimeout(timeoutMs, () => {
+      const timeoutError = new Error(
+        `LLM socket timed out after ${timeoutMs}ms while connecting/reading: ${parsedUrl.origin}. ` +
+          'If this is a company model platform, confirm the base URL is reachable from GitHub Actions or increase LLM_SOCKET_TIMEOUT_MS.',
+      );
+      timeoutError.code = 'LLM_SOCKET_TIMEOUT';
+      req.destroy(timeoutError);
+    });
+
+    req.on('error', (err) => {
+      cleanup();
+      reject(err);
+    });
+
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+    req.write(requestBody);
+    req.end();
+  });
+}
+
+function getConfiguredLlmEndpoint() {
+  return optionalEnv('GEMINI_API_ENDPOINT') || optionalEnv('LLM_API_ENDPOINT') || optionalEnv('OPENAI_API_ENDPOINT');
+}
+
+function getConfiguredLlmBaseUrl() {
+  return optionalEnv('GEMINI_API_BASE_URL') || optionalEnv('LLM_API_BASE_URL') || optionalEnv('OPENAI_BASE_URL') || optionalEnv('OPENAI_API_BASE_URL');
+}
+
+function getLlmApiFormat() {
+  const format = optionalEnv('GEMINI_API_FORMAT') || optionalEnv('LLM_API_FORMAT');
+  if (format) {
+    const normalized = format.toLowerCase();
+    if (['google', 'openai'].includes(normalized)) return normalized;
+    throw new Error(`Unsupported GEMINI_API_FORMAT/LLM_API_FORMAT: ${format}. Use "google" or "openai".`);
+  }
+
+  return getConfiguredLlmBaseUrl() || getConfiguredLlmEndpoint() ? 'openai' : 'google';
+}
+
+function safeEndpointLabel(url) {
+  try {
+    const parsedUrl = new URL(url);
+    return `${parsedUrl.origin}${parsedUrl.pathname}`;
+  } catch {
+    return '(invalid endpoint URL)';
+  }
+}
+
+let hasLoggedLlmRouting = false;
+
+function logLlmRouting({ format, model }) {
+  if (hasLoggedLlmRouting) return;
+
+  if (format === 'openai') {
+    console.log(`LLM routing: OpenAI-compatible chat completions endpoint=${safeEndpointLabel(buildOpenAiCompatibleEndpoint())}, model=${model}`);
+  } else {
+    console.log(`LLM routing: Google Generative Language API endpoint=https://generativelanguage.googleapis.com/v1beta, model=${model}`);
+  }
+
+  hasLoggedLlmRouting = true;
+}
+
+function buildOpenAiCompatibleEndpoint() {
+  const endpoint = getConfiguredLlmEndpoint();
+  if (endpoint) return endpoint;
+
+  const baseUrl = getConfiguredLlmBaseUrl();
+  if (!baseUrl) throw new Error('Missing GEMINI_API_BASE_URL/LLM_API_BASE_URL/OPENAI_BASE_URL for OpenAI-compatible LLM API format.');
+
+  const trimmed = baseUrl.replace(/\/+$/, '');
+  if (trimmed.endsWith('/chat/completions')) return trimmed;
+  if (trimmed.endsWith('/v1')) return `${trimmed}/chat/completions`;
+  return `${trimmed}/v1/chat/completions`;
+}
+
+function parseResponseTextPart(part) {
+  if (!part) return '';
+  if (typeof part === 'string') return part;
+  if (typeof part?.text === 'string') return part.text;
+  return '';
+}
+
+function extractOpenAiCompatibleText(json) {
+  return (json?.choices || [])
+    .flatMap((choice) => {
+      const content = choice?.message?.content;
+      if (Array.isArray(content)) return content.map(parseResponseTextPart);
+      return [content, choice?.text];
+    })
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+async function throwLlmRequestError(response, providerLabel) {
+  const errorBody = await response.text();
+  let parsedError;
+  try {
+    parsedError = JSON.parse(errorBody)?.error;
+  } catch {
+    parsedError = undefined;
+  }
+
+  const reason = parsedError?.details?.find((detail) => detail?.reason)?.reason;
+  const message = parsedError?.message || errorBody;
+  if (reason === 'API_KEY_INVALID' || message.toLowerCase().includes('api key not valid')) {
+    throw new Error(
+      `${providerLabel} request failed: the configured API key was rejected. ` +
+        'If you use a company model platform, set GEMINI_API_BASE_URL/OPENAI_BASE_URL (or GEMINI_API_ENDPOINT) to that platform\'s OpenAI-compatible endpoint.',
+    );
+  }
+
+  throw new Error(`${providerLabel} request failed: ${response.status} ${message}`);
+}
+
+async function requestGeminiReportGoogle({ apiKey, model, prompt, signal }) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
   // Gemini 3.x recommends temperature=1.0; lower values (e.g. 0.2) may cause
   // looping or degraded output. Keep 1.0 as default for gemini-3 compatibility.
@@ -1470,23 +1790,18 @@ async function requestGeminiReportOnce({ apiKey, model, prompt }) {
   const thinkingLevel = process.env.GEMINI_THINKING_LEVEL;
   const thinkingConfig = thinkingLevel ? { thinkingConfig: { thinkingLevel: thinkingLevel.toUpperCase() } } : {};
 
-  let response;
-  try {
-    response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig,
-        ...thinkingConfig,
-      }),
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
+  const response = await requestJson(url, {
+    headers: { 'Content-Type': 'application/json' },
+    body: {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig,
+      ...thinkingConfig,
+    },
+    signal,
+    timeoutMs: getLlmSocketTimeoutMs(),
+  });
 
-  if (!response.ok) throw new Error(`Gemini request failed: ${response.status} ${await response.text()}`);
+  if (!response.ok) await throwLlmRequestError(response, 'Gemini');
   const json = await response.json();
 
   // Check if output was truncated due to token limit
@@ -1499,12 +1814,54 @@ async function requestGeminiReportOnce({ apiKey, model, prompt }) {
 
   // Extract text parts, skipping thinking parts (Gemini 3 returns thought: true on internal reasoning)
   const text = (json?.candidates || [])
-    .flatMap((c) => (c?.content?.parts || []).filter((p) => !p?.thought).map((p) => p?.text).filter(Boolean))
+    .flatMap((c) => (c?.content?.parts || []).filter((part) => !part?.thought).map((part) => part?.text).filter(Boolean))
     .join('\n')
     .trim();
 
   if (!text) throw new Error('Gemini returned empty textual output.');
   return text;
+}
+
+async function requestGeminiReportOpenAiCompatible({ apiKey, model, prompt, signal }) {
+  const endpoint = buildOpenAiCompatibleEndpoint();
+  const maxTokens = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS || process.env.LLM_MAX_OUTPUT_TOKENS || 65536);
+  const temperature = Number(process.env.GEMINI_TEMPERATURE || process.env.LLM_TEMPERATURE || 1.0);
+
+  const response = await requestJson(endpoint, {
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: {
+      model,
+      messages: [{ role: 'user', content: prompt }],
+      temperature,
+      max_tokens: maxTokens,
+    },
+    signal,
+    timeoutMs: getLlmSocketTimeoutMs(),
+  });
+
+  if (!response.ok) await throwLlmRequestError(response, 'OpenAI-compatible LLM');
+  const json = await response.json();
+  const text = extractOpenAiCompatibleText(json);
+  if (!text) throw new Error('OpenAI-compatible LLM returned empty textual output.');
+  return text;
+}
+
+async function requestGeminiReportOnce({ apiKey, model, prompt }) {
+  const controller = new AbortController();
+  const requestTimeoutMs = getLlmRequestTimeoutMs();
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs); // large model output can need more time
+
+  try {
+    const format = getLlmApiFormat();
+    logLlmRouting({ format, model });
+    if (format === 'openai') return await requestGeminiReportOpenAiCompatible({ apiKey, model, prompt, signal: controller.signal });
+    return await requestGeminiReportGoogle({ apiKey, model, prompt, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function requestGeminiReport(params) {
@@ -1571,6 +1928,291 @@ async function runApifyBatched(templateInput, handles, since, until, { batchSize
 
   console.log(`Apify batched fetch complete: ${batches.length} batches, ${allItems.length} total items`);
   return allItems;
+}
+
+
+function bjtDateStringToUtcDate(dateStr) {
+  return new Date(`${dateStr}T00:00:00+08:00`);
+}
+
+function maxDate(a, b) {
+  return a.getTime() >= b.getTime() ? a : b;
+}
+
+function normalizeTwitterApiAuthHeaders() {
+  const headerName = getTwitterApiKeyHeaderName();
+  const apiKey = requireEnv('TWITTER_API_KEY');
+  return {
+    Accept: 'application/json',
+    [headerName]: headerName.toLowerCase() === 'authorization' && !/^Bearer\s+/i.test(apiKey)
+      ? `Bearer ${apiKey}`
+      : apiKey,
+  };
+}
+
+async function fetchTwitterApiPageOnce({ handle, cursor }) {
+  const url = new URL(getTwitterApiEndpoint());
+  url.searchParams.set('userName', normalizeHandle(handle));
+  url.searchParams.set('includeReplies', optionalEnv('TWITTER_API_INCLUDE_REPLIES') || 'True');
+  if (cursor) url.searchParams.set('cursor', cursor);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), getTwitterApiRequestTimeoutMs());
+  try {
+    const response = await fetch(url, {
+      headers: normalizeTwitterApiAuthHeaders(),
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`TwitterAPI fetch failed for @${handle}: ${response.status} ${text.slice(0, 500)}`);
+    return text ? JSON.parse(text) : {};
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchTwitterApiPage(params) {
+  return withRetry(() => fetchTwitterApiPageOnce(params), { label: `TwitterAPI @${params.handle}`, retries: 3, baseDelayMs: 3000 });
+}
+
+function extractTwitterApiTweets(data) {
+  if (Array.isArray(data?.tweets)) return data.tweets;
+  if (Array.isArray(data?.data?.tweets)) return data.data.tweets;
+  return [];
+}
+
+function extractTwitterApiNextCursor(data) {
+  return String(data?.next_cursor || data?.data?.next_cursor || '').trim();
+}
+
+function extractTwitterApiHasNextPage(data) {
+  return Boolean(data?.has_next_page || data?.data?.has_next_page);
+}
+
+function normalizeTwitterApiTweet(tweet, fallbackHandle = '') {
+  const quotedTweet = tweet?.quoted_tweet && typeof tweet.quoted_tweet === 'object' ? tweet.quoted_tweet : null;
+  const retweetedTweet = tweet?.retweeted_tweet && typeof tweet.retweeted_tweet === 'object' ? tweet.retweeted_tweet : null;
+  const handle = normalizeHandle(tweet?.author?.userName || fallbackHandle);
+  const inReplyToId = String(tweet?.inReplyToId || '').trim();
+  const quotedTweetId = String(quotedTweet?.id || '').trim();
+  const retweetedTweetId = String(retweetedTweet?.id || '').trim();
+  const parsedCreatedAt = tweet?.createdAt ? parseDateLoose(tweet.createdAt) : null;
+
+  return {
+    type: tweet?.type || 'tweet',
+    id: String(tweet?.id || '').trim(),
+    url: String(tweet?.url || '').trim(),
+    text: String(tweet?.text || ''),
+    createdAt: parsedCreatedAt && !Number.isNaN(parsedCreatedAt.getTime()) ? parsedCreatedAt.toISOString() : '',
+    lang: tweet?.lang || '',
+    author: {
+      userName: handle,
+      id: String(tweet?.author?.id || '').trim(),
+      name: String(tweet?.author?.name || handle).trim(),
+      url: String(tweet?.author?.url || '').trim(),
+      followers: Number(tweet?.author?.followers || 0),
+      verifiedType: tweet?.author?.verifiedType || '',
+      isBlueVerified: Boolean(tweet?.author?.isBlueVerified),
+      description: String(tweet?.author?.description || tweet?.author?.profile_bio?.description || '').trim(),
+    },
+    conversationId: String(tweet?.conversationId || '').trim(),
+    inReplyToStatusId: inReplyToId,
+    inReplyToStatusIdStr: inReplyToId,
+    inReplyToUsername: normalizeHandle(tweet?.inReplyToUsername),
+    quotedStatusId: quotedTweetId,
+    quotedStatusIdStr: quotedTweetId,
+    retweetedStatusId: retweetedTweetId,
+    retweetedStatusIdStr: retweetedTweetId,
+    referencedTweets: [
+      inReplyToId ? { id: inReplyToId, type: 'replied_to' } : null,
+      quotedTweetId ? { id: quotedTweetId, type: 'quoted' } : null,
+      retweetedTweetId ? { id: retweetedTweetId, type: 'retweeted' } : null,
+    ].filter(Boolean),
+    isReply: Boolean(tweet?.isReply),
+    retweetCount: Number(tweet?.retweetCount || 0),
+    replyCount: Number(tweet?.replyCount || 0),
+    likeCount: Number(tweet?.likeCount || 0),
+    quoteCount: Number(tweet?.quoteCount || 0),
+    viewCount: Number(tweet?.viewCount || 0),
+    bookmarkCount: Number(tweet?.bookmarkCount || 0),
+    entities: tweet?.entities || {},
+    quoted_tweet: quotedTweet,
+    retweeted_tweet: retweetedTweet,
+    source: 'twitterapi',
+    raw: tweet,
+  };
+}
+
+function getOldestTweetTimeMs(tweets) {
+  const times = tweets
+    .map((tweet) => parseDateLoose(tweet?.createdAt)?.getTime())
+    .filter((time) => Number.isFinite(time));
+  return times.length > 0 ? Math.min(...times) : NaN;
+}
+
+async function fetchTwitterApiTweetsForHandle({ handle, stopAt, maxItemsPerUser }) {
+  let cursor = '';
+  const allTweets = [];
+  const maxPages = getTwitterApiMaxPagesPerUser();
+  const pageDelayMs = getTwitterApiPageDelayMs();
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const data = await fetchTwitterApiPage({ handle, cursor });
+    const pageTweets = extractTwitterApiTweets(data).map((tweet) => normalizeTwitterApiTweet(tweet, handle));
+    allTweets.push(...pageTweets);
+
+    const oldestMs = getOldestTweetTimeMs(pageTweets);
+    const hasReachedStop = Number.isFinite(oldestMs) && oldestMs < stopAt.getTime();
+    const hasNextPage = extractTwitterApiHasNextPage(data);
+    const nextCursor = extractTwitterApiNextCursor(data);
+
+    console.log(
+      `TwitterAPI @${handle}: page=${page + 1}, tweets=${pageTweets.length}, total=${allTweets.length}, ` +
+      `oldest=${Number.isFinite(oldestMs) ? new Date(oldestMs).toISOString() : 'n/a'}, stop=${stopAt.toISOString()}`,
+    );
+
+    if (hasReachedStop || !hasNextPage || !nextCursor || pageTweets.length === 0 || allTweets.length >= maxItemsPerUser) break;
+    cursor = nextCursor;
+    if (pageDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, pageDelayMs));
+  }
+
+  return allTweets.slice(0, maxItemsPerUser);
+}
+
+function createEmptyTweetStore() {
+  return { version: 1, updatedAt: new Date().toISOString(), tweets: {}, fetchState: {} };
+}
+
+async function loadTweetStore() {
+  const storePath = getTweetStorePath();
+  try {
+    const raw = await fs.readFile(storePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return {
+      version: parsed?.version || 1,
+      updatedAt: parsed?.updatedAt || '',
+      tweets: parsed?.tweets && typeof parsed.tweets === 'object' ? parsed.tweets : {},
+      fetchState: parsed?.fetchState && typeof parsed.fetchState === 'object' ? parsed.fetchState : {},
+    };
+  } catch {
+    return createEmptyTweetStore();
+  }
+}
+
+async function saveTweetStore(store) {
+  const storePath = getTweetStorePath();
+  store.updatedAt = new Date().toISOString();
+  await fs.mkdir(path.dirname(storePath), { recursive: true });
+  await fs.writeFile(storePath, JSON.stringify(store, null, 2), 'utf8');
+}
+
+function upsertTweetsIntoStore(store, tweets) {
+  let inserted = 0;
+  let updated = 0;
+  for (const tweet of tweets) {
+    const key = String(tweet?.id || getItemUniqueKey(tweet)).trim();
+    if (!key) continue;
+    if (store.tweets[key]) updated += 1;
+    else inserted += 1;
+    store.tweets[key] = { ...store.tweets[key], ...tweet, storedAt: new Date().toISOString() };
+  }
+  return { inserted, updated };
+}
+
+function pruneTweetStore(store) {
+  const retentionDays = getTweetStoreRetentionDays();
+  const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+  let removed = 0;
+  for (const [key, tweet] of Object.entries(store.tweets)) {
+    const createdAtMs = parseDateLoose(tweet?.createdAt)?.getTime();
+    if (Number.isFinite(createdAtMs) && createdAtMs < cutoff) {
+      delete store.tweets[key];
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
+function loadTweetsFromStore(store, { handles, since, until }) {
+  const handleSet = new Set((handles || []).map((handle) => normalizeHandle(handle)).filter(Boolean));
+  return Object.values(store.tweets)
+    .filter((tweet) => {
+      const handle = normalizeHandle(extractHandleFromItem(tweet));
+      if (handleSet.size > 0 && !handleSet.has(handle)) return false;
+      const bjtDate = extractItemBjtDate(tweet);
+      return isDateInHalfOpenRange(bjtDate, since, until);
+    })
+    .sort((a, b) => (parseDateLoose(b?.createdAt)?.getTime() || 0) - (parseDateLoose(a?.createdAt)?.getTime() || 0));
+}
+
+async function syncTwitterApiTweetsForHandles({ handles, since, store, forceFullWindow = false, maxItemsPerUser = 1000 }) {
+  const concurrency = getTwitterApiConcurrency();
+  const sinceBoundary = bjtDateStringToUtcDate(since);
+  const overlapMs = getTwitterApiFetchOverlapHours() * 60 * 60 * 1000;
+  let fetched = 0;
+  let inserted = 0;
+  let updated = 0;
+
+  for (let i = 0; i < handles.length; i += concurrency) {
+    const chunk = handles.slice(i, i + concurrency);
+    const results = await Promise.all(chunk.map(async (handle) => {
+      const normalizedHandle = normalizeHandle(handle);
+      const state = store.fetchState[normalizedHandle] || {};
+      const lastSuccessAtMs = !forceFullWindow && state.lastSuccessAt ? parseDateLoose(state.lastSuccessAt)?.getTime() : NaN;
+      const stopAt = Number.isFinite(lastSuccessAtMs)
+        ? maxDate(sinceBoundary, new Date(lastSuccessAtMs - overlapMs))
+        : sinceBoundary;
+
+      try {
+        const tweets = await fetchTwitterApiTweetsForHandle({ handle: normalizedHandle, stopAt, maxItemsPerUser });
+        const oldestMs = getOldestTweetTimeMs(tweets);
+        const newestMs = tweets
+          .map((tweet) => parseDateLoose(tweet?.createdAt)?.getTime())
+          .filter((time) => Number.isFinite(time))
+          .reduce((max, time) => Math.max(max, time), 0);
+        store.fetchState[normalizedHandle] = {
+          lastSuccessAt: new Date().toISOString(),
+          newestTweetCreatedAt: newestMs ? new Date(newestMs).toISOString() : state.newestTweetCreatedAt || '',
+          oldestTweetCreatedAtLastRun: Number.isFinite(oldestMs) ? new Date(oldestMs).toISOString() : '',
+          lastError: '',
+        };
+        return { handle: normalizedHandle, tweets };
+      } catch (err) {
+        console.warn(`TwitterAPI fetch failed for @${normalizedHandle}: ${describeError(err)}`);
+        store.fetchState[normalizedHandle] = {
+          ...state,
+          lastError: describeError(err),
+          updatedAt: new Date().toISOString(),
+        };
+        return { handle: normalizedHandle, tweets: [] };
+      }
+    }));
+
+    for (const result of results) {
+      fetched += result.tweets.length;
+      const stats = upsertTweetsIntoStore(store, result.tweets);
+      inserted += stats.inserted;
+      updated += stats.updated;
+    }
+    console.log(`TwitterAPI sync progress: ${Math.min(i + concurrency, handles.length)}/${handles.length} handles, fetched=${fetched}`);
+  }
+
+  const pruned = pruneTweetStore(store);
+  await saveTweetStore(store);
+  console.log(`TwitterAPI store synced: fetched=${fetched}, inserted=${inserted}, updated=${updated}, pruned=${pruned}, total=${Object.keys(store.tweets).length}`);
+  return { fetched, inserted, updated, pruned };
+}
+
+async function fetchItemsForHandles({ dataSource, templateInput, handles, since, until, maxItems = 1000 }) {
+  if (dataSource === 'twitterapi') {
+    const store = await loadTweetStore();
+    await syncTwitterApiTweetsForHandles({ handles, since, store, maxItemsPerUser: maxItems });
+    return loadTweetsFromStore(store, { handles, since, until });
+  }
+
+  return handles.length > 30
+    ? await runApifyBatched(templateInput, handles, since, until, { maxItems })
+    : (await runApify(buildApifyInput(templateInput, handles, since, until, maxItems))).items;
 }
 
 async function generateSummary({ apiKey, model, reportMarkdown }) {
@@ -1748,7 +2390,7 @@ async function generateReport(items, top20, stats, peopleStats) {
     return `# AI Pulse - X Daily Brief\n\n今日无可用AI相关内容。\n`;
   }
 
-  const apiKey = requireEnv('GEMINI_API_KEY');
+  const apiKey = requireGeminiApiKey();
   const model = requireEnv('GEMINI_MODEL');
   console.log(`Using GEMINI_MODEL=${model}`);
 
@@ -2278,12 +2920,16 @@ async function generateActionSheet(allDailyItems, top20) {
 
 async function main() {
   requiredEnv.forEach(requireEnv);
+  const dataSource = getTweetDataSource();
+  requireDataSourceEnv(dataSource);
+  requireGeminiApiKey();
+  console.log(`Tweet data source: ${dataSource}`);
 
   const templateRaw = optionalEnv('APIFY_ACTOR_INPUT_JSON');
   const templateInput = templateRaw ? parseApifyInputTemplate(templateRaw) : {};
   const roster = getRosterFromEnvOrTemplate(templateInput);
   if (roster.length === 0) {
-    throw new Error('No people roster found. Set APIFY_PEOPLE_JSON or provide searchTerms in APIFY_ACTOR_INPUT_JSON.');
+    throw new Error('No people roster found. Set TWITTER_PEOPLE_JSON/TWEET_PEOPLE_JSON/APIFY_PEOPLE_JSON or provide searchTerms in APIFY_ACTOR_INPUT_JSON.');
   }
 
   const today = formatBjtDateDaysAgo(0);
@@ -2292,12 +2938,20 @@ async function main() {
   const weekAgo = formatBjtDateDaysAgo(7);
 
   const rosterHandles = roster.map((p) => p.handle);
-  console.log(`Fetching weekly data for ${rosterHandles.length} people (${weekAgo} ~ ${today})...`);
-  console.log(`Example weekly searchTerm: from:${roster[0].handle} since:${weekAgo} until:${today}`);
-  // Use batched concurrent calls for large roster to speed up fetching
-  const weeklyItems = rosterHandles.length > 30
-    ? await runApifyBatched(templateInput, rosterHandles, weekAgo, today)
-    : (await runApify(buildApifyInput(templateInput, rosterHandles, weekAgo, today, 1000))).items;
+  console.log(`Fetching weekly data for ${rosterHandles.length} people (${weekAgo} ~ ${today}) via ${dataSource}...`);
+  if (dataSource === 'apify') {
+    console.log(`Example weekly searchTerm: from:${roster[0].handle} since:${weekAgo} until:${today}`);
+  } else {
+    console.log(`Example weekly TwitterAPI userName: ${roster[0].handle}`);
+  }
+  const weeklyItems = await fetchItemsForHandles({
+    dataSource,
+    templateInput,
+    handles: rosterHandles,
+    since: weekAgo,
+    until: today,
+    maxItems: 1000,
+  });
   console.log(`Weekly items: ${weeklyItems.length}`);
 
   await fs.mkdir('artifacts', { recursive: true });
@@ -2316,11 +2970,16 @@ async function main() {
   const dailyTargetUntil = tomorrow; // exclusive: include yesterday and today
   const dailyQuerySince = formatBjtDateDaysAgo(2);
   const dailyQueryUntil = tomorrow;
-  const dailyInput = buildApifyInput(templateInput, top20.map((p) => p.handle), dailyQuerySince, dailyQueryUntil, 1000);
   if (top20.length > 0) {
-    console.log(
-      `Example daily searchTerm: from:${top20[0].handle} since:${dailyQuerySince} until:${dailyQueryUntil} (target BJT range: [${dailyTargetSince}, ${dailyTargetUntil}))`,
-    );
+    if (dataSource === 'apify') {
+      console.log(
+        `Example daily searchTerm: from:${top20[0].handle} since:${dailyQuerySince} until:${dailyQueryUntil} (target BJT range: [${dailyTargetSince}, ${dailyTargetUntil}))`,
+      );
+    } else {
+      console.log(
+        `Example daily TwitterAPI userName: ${top20[0].handle} (query window ${dailyQuerySince} ~ ${dailyQueryUntil}, target BJT range: [${dailyTargetSince}, ${dailyTargetUntil}))`,
+      );
+    }
   }
   const dailyFromWeekly = selectDailyItemsFromWeekly({
     weeklyItems,
@@ -2351,9 +3010,16 @@ async function main() {
     dailyItems = dailyFromWeekly;
     console.log(`Daily fetch skipped: reused weekly subset (${dailyItems.length} items, top20=${top20.length})`);
   } else {
-    const daily = await runApify(dailyInput);
-    dailyItems = mergeUniqueItems(dailyFromWeekly, daily.items);
-    console.log(`Daily fetched via Apify and merged: weeklySubset=${dailyFromWeekly.length}, fetched=${daily.items.length}, merged=${dailyItems.length}`);
+    const fetchedDailyItems = await fetchItemsForHandles({
+      dataSource,
+      templateInput,
+      handles: top20.map((p) => p.handle),
+      since: dailyQuerySince,
+      until: dailyQueryUntil,
+      maxItems: 1000,
+    });
+    dailyItems = mergeUniqueItems(dailyFromWeekly, fetchedDailyItems);
+    console.log(`Daily fetched via ${dataSource} and merged: weeklySubset=${dailyFromWeekly.length}, fetched=${fetchedDailyItems.length}, merged=${dailyItems.length}`);
   }
   dailyItems = filterItemsByBjtDateRange(dailyItems, dailyTargetSince, dailyTargetUntil);
   console.log(`Daily items after precise BJT date filter [${dailyTargetSince}, ${dailyTargetUntil}): ${dailyItems.length}`);
@@ -2372,7 +3038,7 @@ async function main() {
   await fs.writeFile('artifacts/daily-report.md', report, 'utf8');
 
   // Cross-validate with Chinese AI media and save iteration log
-  const apiKey = requireEnv('GEMINI_API_KEY');
+  const apiKey = requireGeminiApiKey();
   const model = requireEnv('GEMINI_MODEL');
   const crossValidation = await crossValidateWithMedia({ apiKey, model, reportMarkdown: report });
   if (crossValidation) {

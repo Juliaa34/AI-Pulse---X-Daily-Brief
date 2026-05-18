@@ -34,7 +34,15 @@ jobs:
       - name: Syntax check daily-report script
         run: node --check scripts/daily-report.mjs
 
-      - name: Run daily report pipeline (Apify -> Gemini -> Email)
+      - name: Restore tweet store cache
+        uses: actions/cache@v4
+        with:
+          path: AI日报/artifacts/twitter-tweet-store.json
+          key: twitter-tweet-store-${{ github.run_id }}
+          restore-keys: |
+            twitter-tweet-store-
+
+      - name: Run daily report pipeline (Tweets -> Gemini -> Email)
         run: npm run run:daily-report
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
@@ -42,10 +50,40 @@ jobs:
           APIFY_ACTOR_ID: ${{ secrets.APIFY_ACTOR_ID }}
           APIFY_ACTOR_INPUT_JSON: ${{ secrets.APIFY_ACTOR_INPUT_JSON }}
           APIFY_PEOPLE_JSON: ${{ secrets.APIFY_PEOPLE_JSON }}
+          TWEET_DATA_SOURCE: ${{ secrets.TWEET_DATA_SOURCE }}
+          TWITTER_DATA_SOURCE: ${{ secrets.TWITTER_DATA_SOURCE }}
+          TWITTER_PEOPLE_JSON: ${{ secrets.TWITTER_PEOPLE_JSON }}
+          TWEET_PEOPLE_JSON: ${{ secrets.TWEET_PEOPLE_JSON }}
+          TWITTER_API_KEY: ${{ secrets.TWITTER_API_KEY }}
+          TWITTER_API_ENDPOINT: ${{ secrets.TWITTER_API_ENDPOINT }}
+          TWITTER_API_KEY_HEADER: ${{ secrets.TWITTER_API_KEY_HEADER }}
+          TWITTER_API_INCLUDE_REPLIES: ${{ secrets.TWITTER_API_INCLUDE_REPLIES }}
+          TWITTER_API_MAX_PAGES_PER_USER: ${{ secrets.TWITTER_API_MAX_PAGES_PER_USER }}
+          TWITTER_API_CONCURRENCY: ${{ secrets.TWITTER_API_CONCURRENCY }}
+          TWITTER_API_PAGE_DELAY_MS: ${{ secrets.TWITTER_API_PAGE_DELAY_MS }}
+          TWITTER_API_REQUEST_TIMEOUT_MS: ${{ secrets.TWITTER_API_REQUEST_TIMEOUT_MS }}
+          TWITTER_FETCH_OVERLAP_HOURS: ${{ secrets.TWITTER_FETCH_OVERLAP_HOURS }}
+          TWEET_STORE_PATH: ${{ secrets.TWEET_STORE_PATH }}
+          TWEET_STORE_RETENTION_DAYS: ${{ secrets.TWEET_STORE_RETENTION_DAYS }}
 
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_GEMINI_API_KEY: ${{ secrets.GOOGLE_GEMINI_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          GEMINI_API_FORMAT: ${{ secrets.GEMINI_API_FORMAT }}
+          GEMINI_API_BASE_URL: ${{ secrets.GEMINI_API_BASE_URL }}
+          GEMINI_API_ENDPOINT: ${{ secrets.GEMINI_API_ENDPOINT }}
+          LLM_API_FORMAT: ${{ secrets.LLM_API_FORMAT }}
+          LLM_API_BASE_URL: ${{ secrets.LLM_API_BASE_URL }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_API_BASE_URL: ${{ secrets.OPENAI_API_BASE_URL }}
+          LLM_API_ENDPOINT: ${{ secrets.LLM_API_ENDPOINT }}
+          OPENAI_API_ENDPOINT: ${{ secrets.OPENAI_API_ENDPOINT }}
           GEMINI_TEMPERATURE: ${{ secrets.GEMINI_TEMPERATURE }}
+          LLM_SOCKET_TIMEOUT_MS: ${{ secrets.LLM_SOCKET_TIMEOUT_MS }}
+          LLM_REQUEST_TIMEOUT_MS: ${{ secrets.LLM_REQUEST_TIMEOUT_MS }}
           REPORT_PROMPT_TEMPLATE: ${{ secrets.REPORT_PROMPT_TEMPLATE }}
 
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -70,3 +108,6 @@ jobs:
             AI日报/artifacts/media-cross-validation-sources.json
             AI日报/artifacts/top20-action-sheet.md
             AI日报/artifacts/top20-action-sheet.csv
+            AI日报/artifacts/top20-ranking.json
+            AI日报/artifacts/all-outputs.json
+            AI日报/artifacts/twitter-tweet-store.json
