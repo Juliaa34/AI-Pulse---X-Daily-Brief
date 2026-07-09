@@ -9,7 +9,7 @@ AI 行业日报自动生成 Agent。从 Twitter/X 采集 AI 领域 KOL 动态，
     │
     ▼
 ┌─────────────────────────────────┐
-│  Step 1  Apify 采集近 7 天全量数据  │
+│  Step 1  采集/同步近 7 天 X 数据       │
 └────────────┬────────────────────┘
              ▼
 ┌─────────────────────────────────┐
@@ -19,7 +19,7 @@ AI 行业日报自动生成 Agent。从 Twitter/X 采集 AI 领域 KOL 动态，
 └────────────┬────────────────────┘
              ▼
 ┌─────────────────────────────────┐
-│  Step 3  抓取 TOP20 近 24h 动态   │
+│  Step 3  读取 TOP20 近 24h 动态   │
 │  → 全量 Action Sheet (按topic聚类)│
 │  → AI 相关内容过滤                │
 └────────────┬────────────────────┘
@@ -83,6 +83,8 @@ compositeScore = outputCount + interactionScore × 2
 | `iteration-log.md` | 交叉验证历史记录，按日期累积 |
 | `media-cross-validation-sources.json` | 交叉验证抓取到的微信公众号文章（仅量子位/机器之心/新智元，近2天，优先 Twitter/X 相关新闻） |
 | `top20-ranking.json` | TOP20 排名原始数据 |
+| `all-outputs.json` | 本次用于 TOP20 统计的近 7 天窗口数据 |
+| `twitter-tweet-store.json` | TwitterAPI 模式的滚动 tweet 本地缓存（GitHub Actions cache 会跨运行恢复） |
 
 ## 自迭代机制
 
@@ -111,18 +113,66 @@ compositeScore = outputCount + interactionScore × 2
 
 在 GitHub Actions 页面手动触发 `workflow_dispatch`。
 
+## LLM API 调用逻辑
+
+脚本只有两种调用模式：
+
+1. **Google 原生 Gemini 模式（默认）**：没有配置任何 Base URL / Endpoint 时，使用 `GEMINI_API_KEY` 调用 `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`。
+2. **OpenAI-compatible 公司平台模式**：只要配置了 `GEMINI_API_BASE_URL`、`LLM_API_BASE_URL` 或 `OPENAI_BASE_URL`（或对应的完整 `*_ENDPOINT`），就自动改用 `Authorization: Bearer <API Key>` 调用 `/chat/completions`。公司平台提示“替换模型基址”时，通常就是用这个模式。
+
+最简配置建议：
+
+- 直连 Google：只配 `GEMINI_API_KEY` + `GEMINI_MODEL`。
+- 公司平台：配 `OPENAI_API_KEY`（或 `GEMINI_API_KEY`）+ `OPENAI_BASE_URL`（平台给的模型基址）+ `GEMINI_MODEL`（平台给的模型名）。
+
+脚本运行时会打印一行 `LLM routing: ...`，用于确认实际走的是 Google 还是公司平台 endpoint。
+
+## X/Twitter 数据源
+
+脚本支持两种数据源：
+
+1. **Apify（默认回退）**：沿用 `APIFY_TOKEN` + `APIFY_ACTOR_ID`，按 `from:handle since:... until:...` 生成 `searchTerms`。
+2. **TwitterAPI.io `get user last tweets`**：设置 `TWEET_DATA_SOURCE=twitterapi`（或 `TWITTER_DATA_SOURCE=twitterapi`）后，脚本会逐个用户调用 `https://api.twitterapi.io/twitter/user/last_tweets`，传入 `userName`、`includeReplies`、`cursor`，按 `has_next_page` / `next_cursor` 翻页，并在当前页最老 tweet 早于停止边界时停止。
+
+TwitterAPI 模式会把返回 tweet 归一化为现有内部字段（`id`、`url`、`text`、`createdAt`、`author.userName`、`conversationId`、`inReplyToStatusId` 等），因此后续 TOP20 排名、AI 相关过滤、聚类和日报生成逻辑继续复用。
+
+同时，TwitterAPI 模式会维护 `artifacts/twitter-tweet-store.json`：
+
+- 首次/冷启动时按近 7 天窗口翻页；
+- 后续运行按每个用户的 `lastSuccessAt - TWITTER_FETCH_OVERLAP_HOURS` 增量补抓；
+- 用 tweet `id` upsert，允许重复抓取，避免漏抓；
+- GitHub Actions 通过 cache 恢复该文件，使 TOP20 能基于滚动存储里的过去 7 天数据统计。
+
 ## 环境变量
 
 | 变量 | 必填 | 说明 |
 |------|------|------|
-| `APIFY_TOKEN` | 是 | Apify API Token |
-| `APIFY_ACTOR_ID` | 是 | Apify Actor 标识 |
+| `TWEET_DATA_SOURCE` / `TWITTER_DATA_SOURCE` | 否 | X/Twitter 数据源：`apify` 或 `twitterapi`；未设置时如果存在 `TWITTER_API_KEY` 自动使用 TwitterAPI，否则回退 Apify |
+| `TWITTER_API_KEY` | TwitterAPI 模式是 | TwitterAPI.io API Key |
+| `TWITTER_API_ENDPOINT` | 否 | `get user last tweets` endpoint，默认 `https://api.twitterapi.io/twitter/user/last_tweets` |
+| `TWITTER_API_KEY_HEADER` | 否 | API Key 请求头名，默认 `X-API-Key`；如填 `Authorization` 会自动补 `Bearer ` 前缀 |
+| `TWITTER_API_INCLUDE_REPLIES` | 否 | 传给 TwitterAPI 的 `includeReplies`，默认 `True` |
+| `TWITTER_API_MAX_PAGES_PER_USER` | 否 | 每个用户单次最多翻页数（默认 10） |
+| `TWITTER_API_CONCURRENCY` | 否 | 同时抓取的用户数（默认 5） |
+| `TWITTER_API_PAGE_DELAY_MS` | 否 | 同一用户翻页间隔毫秒数（默认 0） |
+| `TWITTER_API_REQUEST_TIMEOUT_MS` | 否 | TwitterAPI 单次请求超时（默认 60000ms） |
+| `TWITTER_FETCH_OVERLAP_HOURS` | 否 | 增量抓取时向前重叠的小时数（默认 6） |
+| `TWEET_STORE_PATH` | 否 | 滚动 tweet store 路径，默认 `artifacts/twitter-tweet-store.json` |
+| `TWEET_STORE_RETENTION_DAYS` | 否 | 本地 tweet store 保留天数（默认 14） |
+| `TWITTER_PEOPLE_JSON` / `TWEET_PEOPLE_JSON` | 否 | TwitterAPI 模式推荐的人物库 JSON；兼容 `APIFY_PEOPLE_JSON` |
+| `APIFY_TOKEN` | Apify 模式是 | Apify API Token |
+| `APIFY_ACTOR_ID` | Apify 模式是 | Apify Actor 标识 |
 | `APIFY_ACTOR_INPUT_JSON` | 否 | Actor 输入覆盖（含 searchTerms 时自动改写日期窗口） |
-| `APIFY_PEOPLE_JSON` | 否 | 人物库 JSON |
-| `GEMINI_API_KEY` | 是 | Gemini API Key |
-| `GEMINI_MODEL` | 是 | Gemini 模型名 |
+| `APIFY_PEOPLE_JSON` | 否 | 人物库 JSON（TwitterAPI 模式也兼容） |
+| `GEMINI_API_KEY` | 是 | LLM API Key（Google AI Studio 可直接填原始 Gemini key；公司中转/聚合平台也可填平台 key；也可用 `GOOGLE_API_KEY` / `GOOGLE_GEMINI_API_KEY` / `LLM_API_KEY` / `OPENAI_API_KEY` 作为备用 Secret） |
+| `GEMINI_MODEL` | 是 | 模型名（Google 原生格式如 `gemini-...`；公司平台按平台给出的 Gemini/Claude 模型名填写） |
+| `GEMINI_API_FORMAT` / `LLM_API_FORMAT` | 否 | API 协议：`google`（默认，直连 Google Generative Language API）或 `openai`（公司中转/聚合平台常见的 OpenAI-compatible `/chat/completions` 协议） |
+| `GEMINI_API_BASE_URL` / `LLM_API_BASE_URL` / `OPENAI_BASE_URL` | 否 | 公司平台给出的模型基址/Base URL；只要设置该项就会自动走 `openai` 协议，会自动拼接 `/v1/chat/completions` 或 `/chat/completions` |
+| `GEMINI_API_ENDPOINT` / `LLM_API_ENDPOINT` / `OPENAI_API_ENDPOINT` | 否 | 公司平台完整 Chat Completions Endpoint；优先级高于 Base URL |
 | `GEMINI_MAX_OUTPUT_TOKENS` | 否 | 最大输出 token（默认 65536） |
 | `GEMINI_TEMPERATURE` | 否 | 温度参数（默认 1.0） |
+| `LLM_SOCKET_TIMEOUT_MS` / `GEMINI_SOCKET_TIMEOUT_MS` | 否 | LLM 单次 socket 连接/读取超时（默认 60000ms；公司平台从 GitHub Actions 访问较慢时可调大） |
+| `LLM_REQUEST_TIMEOUT_MS` / `GEMINI_REQUEST_TIMEOUT_MS` | 否 | LLM 单次请求整体超时（默认 300000ms） |
 | `GEMINI_THINKING_LEVEL` | 否 | 思考深度 minimal / low / medium / high |
 | `GEMINI_RETRY_WEAK_STRUCTURE` | 否 | 当日报结构过弱（TOP3/中热度/链接不足）时是否自动重试一次 Gemini（默认 true） |
 | `SMTP_HOST` | 是 | SMTP 服务器 |
@@ -135,7 +185,7 @@ compositeScore = outputCount + interactionScore × 2
 | `APIFY_REUSE_RECENT_RUNS` | 否 | 是否优先复用最近成功 run 的 dataset（默认 true） |
 | `APIFY_REUSE_RUNS_LIMIT` | 否 | 复用检查的最近 run 数量（默认 10，最大 50） |
 | `APIFY_REUSE_MAX_AGE_HOURS` | 否 | 仅复用最近 N 小时内的 run（默认 36 小时） |
-| `APIFY_SKIP_SECOND_FETCH_IF_SUFFICIENT` | 否 | 当 weekly 数据已足够覆盖 TOP20 的日窗口时，跳过第二次 Apify 抓取（默认 true） |
+| `APIFY_SKIP_SECOND_FETCH_IF_SUFFICIENT` | 否 | 当 weekly 数据已足够覆盖 TOP20 的日窗口时，跳过第二次补抓（默认 true） |
 | `APIFY_DAILY_MIN_ITEMS` | 否 | 判断 weekly 子集“足够”时的最小日动态数量阈值（默认 80） |
 | `APIFY_DAILY_MAX_MISSING_TOP20` | 否 | 判断 weekly 子集“足够”时允许缺失动态的 TOP20 人数上限（默认 8） |
 | `APIFY_DAILY_MIN_AI_ITEMS` | 否 | 跳过第二次抓取前，weekly 子集里最少 AI 相关动态数（默认 30） |
